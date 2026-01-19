@@ -1,0 +1,140 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+
+BASE_DIR = os.path.dirname(__file__)
+FIG_DIR = os.path.join(BASE_DIR, "figs")
+os.makedirs(FIG_DIR, exist_ok=True)
+np.random.seed(42)
+
+def phi(t, If, Delta):
+    return 0.0 if t < Delta else float(If)
+
+def sir_rhs(t, y, beta, gamma, If, Delta):
+    S, I, R = y
+    ph = phi(t, If, Delta)
+    dS = -beta * S * I
+    dI = beta * S * I - (gamma + ph) * I
+    dR = (gamma + ph) * I
+    return [dS, dI, dR]
+
+def simulate_E(beta, gamma, If, Delta, T=30.0, I0=0.002):
+    S0 = 1.0 - I0
+    y0 = [S0, I0, 0.0]
+    t_eval = np.linspace(0, T, int(T*10)+1)
+    sol = solve_ivp(lambda t, y: sir_rhs(t, y, beta, gamma, If, Delta),
+                    (0, T), y0, t_eval=t_eval, rtol=1e-7, atol=1e-9)
+    I = np.clip(sol.y[1], 0, 1)
+    E = np.sum((I[:-1] + I[1:]) * np.diff(sol.t)) / 2
+    return float(E)
+
+def build_SR_grid(beta=0.9, gamma=0.25, T=30.0, Delta0=14):
+    E0 = simulate_E(beta, gamma, If=0.0, Delta=0.0, T=T)
+    If_grid = np.linspace(0, 1.0, 21)
+    Delta_grid = np.arange(0, Delta0+1, 1)
+    SR = np.zeros((len(Delta_grid), len(If_grid)))
+    for i, D in enumerate(Delta_grid):
+        for j, Ifv in enumerate(If_grid):
+            E = simulate_E(beta, gamma, If=float(Ifv), Delta=float(D), T=T)
+            SR[i, j] = (E0 - E) / E0
+    return If_grid, Delta_grid, SR
+
+def cost(If, Delta, a=1.0, b=10.0, Delta0=14.0):
+    return b*(If**2) + a*((Delta0 - Delta)**2)
+
+def normalize_cost(C, C_min, C_max):
+    if C_max - C_min < 1e-12:
+        return 0.0
+    return (C - C_min) / (C_max - C_min)
+
+def main():
+    beta, gamma, T = 0.9, 0.25, 30.0
+    Delta0 = 14
+    a = 1.0
+    b = 10.0
+    w_list = np.linspace(0.10, 0.90, 17)
+
+    If_grid, Delta_grid, SR_grid = build_SR_grid(beta, gamma, T=T, Delta0=Delta0)
+
+    C_grid = np.zeros_like(SR_grid)
+    for i, D in enumerate(Delta_grid):
+        for j, Ifv in enumerate(If_grid):
+            C_grid[i, j] = cost(float(Ifv), float(D), a=a, b=b, Delta0=Delta0)
+
+    Cmin, Cmax = float(C_grid.min()), float(C_grid.max())
+
+    results = []
+    for w in w_list:
+        best = None
+        bestJ = -1e18
+        for i, D in enumerate(Delta_grid):
+            for j, Ifv in enumerate(If_grid):
+                SR = float(SR_grid[i, j])
+                Cn = normalize_cost(float(C_grid[i, j]), Cmin, Cmax)
+                J = w*SR - (1-w)*Cn
+                if J > bestJ:
+                    bestJ = J
+                    best = (float(Ifv), float(D), SR, float(C_grid[i, j]), Cn, J)
+        If_opt, D_opt, SR_opt, C_opt, Cn_opt, J_opt = best
+        results.append({
+            "w": float(w), "If": If_opt, "Delta": D_opt,
+            "SR": SR_opt, "Cost": C_opt, "Cost_norm": Cn_opt, "J": J_opt
+        })
+
+    print("=== Q4 optimal policies under different w (b=10) ===")
+    for r in results:
+        print(f"w={r['w']:.2f} -> If={r['If']:.2f}, Δ={r['Delta']:.1f} days, SR={r['SR']:.3f}, Cost={r['Cost']:.3f}")
+
+    w_target = 0.50
+    rec = min(results, key=lambda d: abs(d["w"] - w_target))
+    print("\n=== Recommended balanced policy (w=0.5, b=10) ===")
+    print(rec)
+
+    SRs = [r["SR"] for r in results]
+    Costs = [r["Cost"] for r in results]
+    plt.figure(figsize=(7.8, 4.8))
+    plt.plot(Costs, SRs, "o-")
+    plt.xlabel("Cost")
+    plt.ylabel("SR")
+    plt.title("Q4: Trade-off curve (optimal points under different w)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, "Figure_Q4_policy_curve.png"), dpi=200)
+    plt.close()
+
+    def solve_for_b(b_val):
+        Cg = np.zeros_like(SR_grid)
+        for i, D in enumerate(Delta_grid):
+            for j, Ifv in enumerate(If_grid):
+                Cg[i, j] = cost(float(Ifv), float(D), a=a, b=b_val, Delta0=Delta0)
+        cmin, cmax = float(Cg.min()), float(Cg.max())
+        best = None
+        bestJ = -1e18
+        for i, D in enumerate(Delta_grid):
+            for j, Ifv in enumerate(If_grid):
+                SR = float(SR_grid[i, j])
+                Cn = normalize_cost(float(Cg[i, j]), cmin, cmax)
+                J = w_target*SR - (1-w_target)*Cn
+                if J > bestJ:
+                    bestJ = J
+                    best = (float(Ifv), float(D), SR, float(Cg[i, j]), Cn, J)
+        return best
+
+    b1 = solve_for_b(1.0)
+    b10 = solve_for_b(10.0)
+
+    plt.figure(figsize=(7.2, 4.8))
+    plt.scatter([b1[3], b10[3]], [b1[2], b10[2]])
+    for (lbl, sol) in [("b=1", b1), ("b=10", b10)]:
+        plt.annotate(f"{lbl}\nIf={sol[0]:.2f},Δ={sol[1]:.0f}", (sol[3], sol[2]))
+    plt.xlabel("Cost")
+    plt.ylabel("SR")
+    plt.title("Q4: Robustness compare (w=0.5)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, "Figure_Q4_robust_compare.png"), dpi=200)
+    plt.close()
+
+    print("\nSaved Q4 figures to:", FIG_DIR)
+
+if __name__ == "__main__":
+    main()
