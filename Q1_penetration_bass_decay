@@ -1,0 +1,258 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+from scipy.optimize import least_squares
+
+BASE_DIR = os.path.dirname(__file__)
+FIG_DIR = os.path.join(BASE_DIR, "figs")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(FIG_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+np.random.seed(42)
+
+def bass_decay_rhs(t, y, p, q, M, tau):
+    P = float(y[0])
+    P = max(0.0, min(1.0, P))
+    dP = (p + q * (P / max(M, 1e-9))) * (M - P) - (1.0 / max(tau, 1e-9)) * P
+    return [dP]
+
+def solve_bass_decay(t_grid, p, q, M, tau, P0):
+    t0, t1 = float(t_grid[0]), float(t_grid[-1])
+    sol = solve_ivp(
+        fun=lambda t, y: bass_decay_rhs(t, y, p, q, M, tau),
+        t_span=(t0, t1),
+        y0=[P0],
+        t_eval=t_grid,
+        rtol=1e-7,
+        atol=1e-9
+    )
+    if not sol.success:
+        raise RuntimeError("ODE solve failed.")
+    P = sol.y[0]
+    return np.clip(P, 0.0, 1.0)
+
+def t50_from_curve(t_grid, P_curve, M):
+    target = 0.5 * M
+    idx = np.where(P_curve >= target)[0]
+    if len(idx) == 0:
+        return np.nan
+    i = idx[0]
+    if i == 0:
+        return float(t_grid[0])
+    t0, t1 = t_grid[i-1], t_grid[i]
+    y0, y1 = P_curve[i-1], P_curve[i]
+    if abs(y1 - y0) < 1e-12:
+        return float(t1)
+    return float(t0 + (target - y0) * (t1 - t0) / (y1 - y0))
+
+def maybe_generate_monthly_data(csv_path, params, P0=0.02, noise_sd=0.01):
+    if os.path.exists(csv_path):
+        df = pd.read_csv(csv_path)
+        return df
+    p, q, M, tau = params
+    months = np.arange(0, 60+1)
+    t_years = months / 12.0
+    P_true = solve_bass_decay(t_years, p, q, M, tau, P0)
+    P_obs = np.clip(P_true + np.random.normal(0, noise_sd, size=P_true.shape), 0, 1)
+    df = pd.DataFrame({
+        "month_index": months,
+        "t_years": t_years,
+        "P_obs": P_obs
+    })
+    df.to_csv(csv_path, index=False)
+    return df
+
+def fit_bass_decay(t, y, bounds, n_starts=30, prior=None, prior_w=0.0):
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    def residuals(theta):
+        p, q, M, tau = theta
+        P0 = max(1e-6, min(0.2, y[0]))
+        P_hat = solve_bass_decay(t, p, q, M, tau, P0)
+        r = (P_hat - y)
+        if prior is not None and prior_w > 0:
+            rp = []
+            rp.append((p - prior["p"]))
+            rp.append((q - prior["q"]))
+            rp.append((M - prior["M"]))
+            rp.append((tau - prior["tau"]))
+            r = np.concatenate([r, prior_w * np.array(rp)])
+        return r
+
+    (lb, ub) = bounds
+    best = None
+    best_cost = np.inf
+
+    for _ in range(n_starts):
+        x0 = np.array([
+            np.random.uniform(lb[0], ub[0]),
+            np.random.uniform(lb[1], ub[1]),
+            np.random.uniform(lb[2], ub[2]),
+            np.random.uniform(lb[3], ub[3]),
+        ])
+        try:
+            res = least_squares(residuals, x0=x0, bounds=(lb, ub), method="trf", max_nfev=2000)
+            cost = res.cost
+            if cost < best_cost and res.success:
+                best_cost = cost
+                best = res.x
+        except Exception:
+            continue
+
+    if best is None:
+        raise RuntimeError("Fit failed in all multistarts.")
+    return best
+
+def fit_metrics(y_true, y_pred):
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    rss = float(np.sum((y_true - y_pred)**2))
+    rmse = float(np.sqrt(np.mean((y_true - y_pred)**2)))
+    tss = float(np.sum((y_true - np.mean(y_true))**2))
+    r2 = 1.0 - rss / tss if tss > 1e-12 else np.nan
+    return rss, rmse, r2
+
+def main():
+    gen_params = (0.02, 1.2, 0.55, 7.0)
+
+    csv_18_29 = os.path.join(DATA_DIR, "SimData_TikTok_18_29.csv")
+    csv_18_22 = os.path.join(DATA_DIR, "SimData_TikTok_18_22.csv")
+    csv_23_29 = os.path.join(DATA_DIR, "SimData_TikTok_23_29.csv")
+
+    df_all = maybe_generate_monthly_data(csv_18_29, gen_params, P0=0.02, noise_sd=0.01)
+    df_1822 = maybe_generate_monthly_data(csv_18_22, (0.018, 1.25, 0.60, 7.8), P0=0.02, noise_sd=0.012)
+    df_2329 = maybe_generate_monthly_data(csv_23_29, (0.020, 1.05, 0.55, 6.9), P0=0.02, noise_sd=0.012)
+
+    lb = np.array([1e-4, 0.05, 0.20, 1.0])
+    ub = np.array([0.20,  3.00, 0.95, 20.0])
+    bounds = (lb, ub)
+
+    t = df_all["t_years"].values
+    y = df_all["P_obs"].values
+
+    theta_hat = fit_bass_decay(t, y, bounds=bounds, n_starts=40)
+    p_hat, q_hat, M_hat, tau_hat = theta_hat
+    P_fit = solve_bass_decay(t, p_hat, q_hat, M_hat, tau_hat, P0=y[0])
+    rss, rmse, r2 = fit_metrics(y, P_fit)
+    t50 = t50_from_curve(t, P_fit, M_hat)
+
+    print("=== Estimated parameters (18–29) ===")
+    print(f"p   = {p_hat:.6f}")
+    print(f"q   = {q_hat:.6f}")
+    print(f"M   = {M_hat:.6f}")
+    print(f"tau = {tau_hat:.6f}")
+    print("=== Fit metrics ===")
+    print(f"RSS  = {rss:.6e}")
+    print(f"RMSE = {rmse:.6e}")
+    print(f"R^2  = {r2:.6f}")
+    print(f"t50  = {t50:.3f} years since 2020-01 -> year ~ {2020 + t50:.3f}")
+
+    plt.figure(figsize=(8, 4.8))
+    plt.plot(t, y, "o", label="Observed (scenario)")
+    plt.plot(t, P_fit, "-", label="Fitted (Bass+decay)")
+    plt.xlabel("t (years since 2020-01)")
+    plt.ylabel("Penetration rate P(t)")
+    plt.title("Q1: Penetration fit (18–29)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, "Figure_Q1_fit.png"), dpi=200)
+    plt.close()
+
+    res = y - P_fit
+    plt.figure(figsize=(8, 4.2))
+    plt.axhline(0, linewidth=1)
+    plt.plot(t, res, "o-")
+    plt.xlabel("t (years since 2020-01)")
+    plt.ylabel("Residual (obs - fit)")
+    plt.title("Q1: Residuals over time (18–29)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, "Figure_Q1_residuals.png"), dpi=200)
+    plt.close()
+
+    q_grid = np.linspace(max(lb[1], 0.2), min(ub[1], 2.0), 25)
+    tau_grid = np.linspace(max(lb[3], 2.0), min(ub[3], 15.0), 25)
+    Yend = np.zeros((len(tau_grid), len(q_grid)))
+    T50 = np.zeros((len(tau_grid), len(q_grid)))
+
+    t_dense = np.linspace(0, 5.0, 300)
+    for i, tau0 in enumerate(tau_grid):
+        for j, q0 in enumerate(q_grid):
+            P0 = float(y[0])
+            P_curve = solve_bass_decay(t_dense, p_hat, q0, M_hat, tau0, P0=P0)
+            Yend[i, j] = P_curve[-1]
+            T50[i, j] = t50_from_curve(t_dense, P_curve, M_hat)
+
+    def save_heatmap(mat, xvals, yvals, fname, title, cbar_label):
+        plt.figure(figsize=(7.8, 5.2))
+        plt.imshow(mat, origin="lower", aspect="auto",
+                   extent=[xvals[0], xvals[-1], yvals[0], yvals[-1]])
+        plt.colorbar(label=cbar_label)
+        plt.xlabel("q (imitation strength)")
+        plt.ylabel("tau (decay timescale, years)")
+        plt.title(title)
+        plt.tight_layout()
+        plt.savefig(os.path.join(FIG_DIR, fname), dpi=200)
+        plt.close()
+
+    save_heatmap(Yend, q_grid, tau_grid, "Figure_Q1_heatmap_yend.png",
+                 "Q1: Sensitivity heatmap of P(2025)", "P(2025)")
+    save_heatmap(T50, q_grid, tau_grid, "Figure_Q1_heatmap_t50.png",
+                 "Q1: Sensitivity heatmap of t50", "t50 (years)")
+
+    prior = {"p": p_hat, "q": q_hat, "M": M_hat, "tau": tau_hat}
+    prior_w = 0.05
+
+    def fit_group(df, tag):
+        tg = df["t_years"].values
+        yg = df["P_obs"].values
+        th = fit_bass_decay(tg, yg, bounds=bounds, n_starts=50, prior=prior, prior_w=prior_w)
+        p, q, M, tau = th
+        Pg = solve_bass_decay(tg, p, q, M, tau, P0=yg[0])
+        rss, rmse, r2 = fit_metrics(yg, Pg)
+        t50g = t50_from_curve(tg, Pg, M)
+
+        print(f"=== Age group {tag} fitted ===")
+        print(f"p={p:.6f}, q={q:.6f}, M={M:.6f}, tau={tau:.6f}, R2={r2:.6f}, t50~{2020+t50g:.3f}")
+
+        plt.figure(figsize=(8, 4.8))
+        plt.plot(tg, yg, "o", label="Observed (scenario)")
+        plt.plot(tg, Pg, "-", label="Fitted")
+        plt.xlabel("t (years since 2020-01)")
+        plt.ylabel("P(t)")
+        plt.title(f"Q1: Fit for age group {tag}")
+        plt.legend()
+        plt.tight_layout()
+        out = os.path.join(FIG_DIR, f"Figure_Q1_fit_age_{tag.replace('–','_').replace('-','_')}.png")
+        plt.savefig(out, dpi=200)
+        plt.close()
+
+        return (p, q, M, tau, r2, t50g)
+
+    p1, q1, M1, tau1, r21, t501 = fit_group(df_1822, "18–22")
+    p2, q2, M2, tau2, r22, t502 = fit_group(df_2329, "23–29")
+
+    plt.figure(figsize=(8, 4.8))
+    plt.plot(df_1822["t_years"], df_1822["P_obs"], "o", label="18–22 obs")
+    plt.plot(df_2329["t_years"], df_2329["P_obs"], "o", label="23–29 obs")
+    plt.xlabel("t (years since 2020-01)")
+    plt.ylabel("P(t)")
+    plt.title("Q1: Age-group scenario observations")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, "Figure_Q1_age_compare.png"), dpi=200)
+    plt.close()
+
+    pM_1822 = p1 * M1
+    pM_2329 = p2 * M2
+    ratio = pM_1822 / pM_2329 if pM_2329 > 1e-12 else np.nan
+    print("\n=== Difference metrics ===")
+    print(f"Early conversion proxy p*M: 18–22={pM_1822:.6f}, 23–29={pM_2329:.6f}, ratio={ratio:.3f}")
+    print(f"t50: 18–22={2020+t501:.3f}, 23–29={2020+t502:.3f}, delta={(t502-t501):.3f} years")
+    print("\nSaved figures to:", FIG_DIR)
+    print("Saved/loaded data in:", DATA_DIR)
+
+if __name__ == "__main__":
+    main()
