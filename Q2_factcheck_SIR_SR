@@ -1,0 +1,108 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+
+BASE_DIR = os.path.dirname(__file__)
+FIG_DIR = os.path.join(BASE_DIR, "figs")
+os.makedirs(FIG_DIR, exist_ok=True)
+np.random.seed(42)
+
+def phi(t, If, Delta):
+    return 0.0 if t < Delta else float(If)
+
+def sir_rhs(t, y, beta, gamma, If, Delta):
+    S, I, R = y
+    S = max(0.0, min(1.0, S))
+    I = max(0.0, min(1.0, I))
+    R = max(0.0, min(1.0, R))
+    ph = phi(t, If, Delta)
+    dS = -beta * S * I
+    dI = beta * S * I - (gamma + ph) * I
+    dR = (gamma + ph) * I
+    return [dS, dI, dR]
+
+def simulate(beta=0.9, gamma=0.25, If=0.6, Delta=5.0, T=30.0, I0=0.002):
+    S0 = 1.0 - I0
+    y0 = [S0, I0, 0.0]
+    t_eval = np.linspace(0, T, int(T*10)+1)
+    sol = solve_ivp(lambda t, y: sir_rhs(t, y, beta, gamma, If, Delta),
+                    (0, T), y0, t_eval=t_eval, rtol=1e-7, atol=1e-9)
+    if not sol.success:
+        raise RuntimeError("SIR solve failed.")
+    S, I, R = sol.y
+    I = np.clip(I, 0, 1)
+    E = np.sum((I[:-1] + I[1:]) * np.diff(sol.t)) / 2
+    return sol.t, S, I, R, float(E)
+
+def main():
+    beta = 0.9
+    gamma = 0.25
+    T = 30.0
+    Delta0 = 14.0
+
+    t0, S0, I0, R0, E0 = simulate(beta, gamma, If=0.0, Delta=0.0, T=T, I0=0.002)
+
+    Delta_fixed = 5.0
+    If_list = [0.0, 0.2, 0.5, 0.8, 1.0]
+    plt.figure(figsize=(8, 4.8))
+    for If in If_list:
+        t, S, I, R, E = simulate(beta, gamma, If=If, Delta=Delta_fixed, T=T, I0=0.002)
+        plt.plot(t, I, label=f"If={If:.1f}")
+    plt.xlabel("Time (days)")
+    plt.ylabel("I(t) (spreader fraction)")
+    plt.title(f"Q2: Propagation curves under different If (Delta={Delta_fixed:.0f} days)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, "Figure_Q2_curves.png"), dpi=200)
+    plt.close()
+
+    If_fixed = 0.6
+    Deltas = np.arange(0, int(Delta0)+1, 1)
+    SRs = []
+    for D in Deltas:
+        _, _, I, _, E = simulate(beta, gamma, If=If_fixed, Delta=float(D), T=T, I0=0.002)
+        SR = (E0 - E) / E0
+        SRs.append(SR)
+
+    plt.figure(figsize=(8, 4.6))
+    plt.plot(Deltas, SRs, "o-")
+    plt.xlabel("Intervention delay Delta (days)")
+    plt.ylabel("SR (suppression rate)")
+    plt.title(f"Q2: SR vs Delta (If={If_fixed:.1f})")
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, "Figure_Q2_SR_vs_Delta.png"), dpi=200)
+    plt.close()
+
+    If_grid = np.linspace(0, 1.0, 21)
+    Delta_grid = np.arange(0, int(Delta0)+1, 1)
+    SR_map = np.zeros((len(Delta_grid), len(If_grid)))
+
+    for i, D in enumerate(Delta_grid):
+        for j, Ifv in enumerate(If_grid):
+            _, _, _, _, E = simulate(beta, gamma, If=float(Ifv), Delta=float(D), T=T, I0=0.002)
+            SR_map[i, j] = (E0 - E) / E0
+
+    plt.figure(figsize=(8, 5.2))
+    plt.imshow(
+        SR_map, origin="lower", aspect="auto",
+        extent=[If_grid[0], If_grid[-1], Delta_grid[0], Delta_grid[-1]]
+    )
+    plt.colorbar(label="SR")
+    plt.xlabel("Fact-check intensity If")
+    plt.ylabel("Delay Delta (days)")
+    plt.title("Q2: SR(If, Delta) heatmap")
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, "Figure_Q2_SR_heatmap.png"), dpi=200)
+    plt.close()
+
+    print("=== Q2 key SR values around early window (If=0.6) ===")
+    for D in [3, 4, 5, 6, 7]:
+        _, _, _, _, E = simulate(beta, gamma, If=If_fixed, Delta=float(D), T=T, I0=0.002)
+        SR = (E0 - E) / E0
+        print(f"Delta={D:2d} days -> SR={SR:.3f}")
+
+    print("\nSaved Q2 figures to:", FIG_DIR)
+
+if __name__ == "__main__":
+    main()
